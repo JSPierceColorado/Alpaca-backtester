@@ -1,24 +1,26 @@
 # Use a slim base with Python 3.12
 FROM python:3.12-slim
 
-# Create and set work directory
+# Workdir
 WORKDIR /app
 
-# Install OS-level dependencies
+# Helpful defaults
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ="America/Denver"
+
+# System deps (minimal)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency list and install
+# Dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# App code
 COPY . .
 
-# Environment defaults (override in Railway)
-ENV TZ="America/Denver" \
-    PYTHONUNBUFFERED=1
-
-# Entry point
+# Entrypoint
 CMD ["python", "alpaca_backtester.py"]
