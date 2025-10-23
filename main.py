@@ -3,6 +3,7 @@
 main.py — Alpaca bots backtester (MODE=momentum | rsi_reversal | both)
 
 - Data fetch: per-symbol pagination (limit=10000, next_page_token) with 1m fallback → resample to 15m
+- Signals/gates: compute rolling indicators on each symbol's non-NaN stream, then reindex to full timeline
 - Buys: NO once-per-day restriction
 - Contributions: +$50 every 14 days starting at START_DATE
 - Sells: take-profit at TAKE_PROFIT_PCT (default 5%), allowed only when SPY 15m MA60 > MA240
@@ -212,6 +213,8 @@ def _fetch_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, minu
                 if DEBUG:
                     print(f"[DEBUG] {sym}: no bars returned")
                 continue
+            # normalize to an exact grid for this symbol
+            s = s.sort_index().resample(f"{minutes}T").last()
             series_list.append(s)
         except Exception as e:
             print(f"[WARN] fetch failed for {sym}: {e}", file=sys.stderr)
@@ -219,8 +222,18 @@ def _fetch_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, minu
     if not series_list:
         return pd.DataFrame()
 
-    df = pd.concat(series_list, axis=1)
-    # Deduplicate timestamps (paranoia) and sort
+    # Build a master time index from SPY if present, else union of all indices
+    spy_series = next((s for s in series_list if getattr(s, "name", None) == "SPY"), None)
+    if spy_series is not None:
+        master_index = spy_series.index
+    else:
+        master_index = series_list[0].index
+        for s in series_list[1:]:
+            master_index = master_index.union(s.index)
+
+    # Reindex each symbol to the master grid (no ffill here; indicators use only real prints)
+    aligned = [s.reindex(master_index) for s in series_list]
+    df = pd.concat(aligned, axis=1)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     return df
 
@@ -246,25 +259,30 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     return macd_line, signal_line, hist
 
 # -----------------------
-# Signals & gates
+# Signals & gates (operate on non-NaN per-symbol streams, then reindex to full timeline)
 # -----------------------
 def spy_gate_allow_buys(close: pd.DataFrame) -> pd.Series:
-    """True where SPY MA60 > MA240 (momentum buy-gate and sell-gate)."""
-    spy = close["SPY"]
-    ma60 = spy.rolling(60, min_periods=60).mean()
-    ma240 = spy.rolling(240, min_periods=240).mean()
-    return (ma60 > ma240) & (~ma60.isna()) & (~ma240.isna())
+    spy_full = pd.Series(False, index=close.index)
+    px = close["SPY"].dropna()
+    if px.empty:
+        return spy_full
+    ma60 = px.rolling(60, min_periods=60).mean()
+    ma240 = px.rolling(240, min_periods=240).mean()
+    gate = (ma60 > ma240)
+    return gate.reindex(close.index, fill_value=False)
 
 def spy_gate_allow_sells(close: pd.DataFrame) -> pd.Series:
-    """Sells allowed only when SPY MA60 > MA240."""
     return spy_gate_allow_buys(close)
 
 def spy_gate_allow_buys_reversal(close: pd.DataFrame) -> pd.Series:
-    """True where SPY MA60 < MA240 (RSI-reversal buy-gate)."""
-    spy = close["SPY"]
-    ma60 = spy.rolling(60, min_periods=60).mean()
-    ma240 = spy.rolling(240, min_periods=240).mean()
-    return (ma60 < ma240) & (~ma60.isna()) & (~ma240.isna())
+    spy_full = pd.Series(False, index=close.index)
+    px = close["SPY"].dropna()
+    if px.empty:
+        return spy_full
+    ma60 = px.rolling(60, min_periods=60).mean()
+    ma240 = px.rolling(240, min_periods=240).mean()
+    gate = (ma60 < ma240)
+    return gate.reindex(close.index, fill_value=False)
 
 def _safe_bool(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(bool).fillna(False)
@@ -279,15 +297,17 @@ def signals_momentum(close: pd.DataFrame) -> pd.DataFrame:
     """
     sig = pd.DataFrame(False, index=close.index, columns=close.columns)
     for sym in close.columns:
-        px = close[sym]
-        ma60 = px.rolling(60, min_periods=60).mean()
+        px = close[sym].dropna()
+        if px.empty:
+            continue
+        ma60  = px.rolling(60,  min_periods=60).mean()
         ma240 = px.rolling(240, min_periods=240).mean()
         r = rsi(px, 14)
         _, _, hist = macd(px)
         cond = (ma60 > ma240) & (px > ma60)
         cond &= r.between(55, 70) & (r > r.shift(1))
         cond &= (hist > 0) & (hist > hist.shift(1))
-        sig[sym] = cond.fillna(False)
+        sig[sym] = cond.reindex(close.index, fill_value=False)
     return sig
 
 def signals_rsi_reversal(close: pd.DataFrame) -> pd.DataFrame:
@@ -298,12 +318,14 @@ def signals_rsi_reversal(close: pd.DataFrame) -> pd.DataFrame:
     """
     sig = pd.DataFrame(False, index=close.index, columns=close.columns)
     for sym in close.columns:
-        px = close[sym]
-        ma60 = px.rolling(60, min_periods=60).mean()
+        px = close[sym].dropna()
+        if px.empty:
+            continue
+        ma60  = px.rolling(60,  min_periods=60).mean()
         ma240 = px.rolling(240, min_periods=240).mean()
         r = rsi(px, 14)
         cond = (ma60 < ma240) & (r < 30)
-        sig[sym] = cond.fillna(False)
+        sig[sym] = cond.reindex(close.index, fill_value=False)
     return sig
 
 # -----------------------
