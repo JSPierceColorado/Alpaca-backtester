@@ -5,7 +5,7 @@ main.py — Alpaca bots backtester (MODE=momentum | rsi_reversal | both)
 - Sells: take-profit at TAKE_PROFIT_PCT (default 5%), allowed only when SPY 15m MA60 > MA240
 - Contributions: adds $50 to buying power every 2 weeks starting at START_DATE
 - All sale proceeds go back to buying power (compounding)
-- One buy per asset per calendar day across BOTH strategies
+- Buys: NO once-per-day restriction (can buy the same symbol multiple times per day if signals persist)
 - Counters printed in summary:
     * buys_momentum
     * buys_reversal (dip buys)
@@ -28,7 +28,6 @@ MODE=both                  # "momentum" | "rsi_reversal" | "both"
 TAKE_PROFIT_PCT=0.05
 NOTIONAL_PCT=0.05
 MIN_ORDER_DOLLARS=1.0
-ONE_BUY_PER_ASSET_PER_DAY=1
 BIWEEKLY_CONTRIB=50.0
 FEE_PCT=0.0
 SLIPPAGE_PCT=0.0
@@ -71,7 +70,6 @@ MODE = os.getenv("MODE", "both").strip().lower()  # "momentum" | "rsi_reversal" 
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))
 NOTIONAL_PCT    = float(os.getenv("NOTIONAL_PCT", "0.05"))
 MIN_ORDER_DOLLARS = float(os.getenv("MIN_ORDER_DOLLARS", "1.0"))
-ONE_BUY_PER_ASSET_PER_DAY = os.getenv("ONE_BUY_PER_ASSET_PER_DAY", "1").lower() in ("1","true","yes")
 
 BIWEEKLY_CONTRIB = float(os.getenv("BIWEEKLY_CONTRIB", "50.0"))
 FEE_PCT = float(os.getenv("FEE_PCT", "0.0"))
@@ -233,8 +231,7 @@ class Position:
 class Portfolio:
     cash: float = 0.0
     positions: Dict[str, Position] = field(default_factory=dict)
-    last_buy_date: Dict[str, Optional[pd.Timestamp.date]] = field(default_factory=dict)
-    # NEW counters
+    # Counters
     buys_momentum: int = 0
     buys_reversal: int = 0
     sells_count: int = 0
@@ -305,13 +302,9 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
                     fee = _fee(notional)
                     pf.cash += (notional - fee)       # proceeds to buying power
                     pf.positions[sym] = Position()    # flat
-                    pf.last_buy_date.pop(sym, None)   # allow re-entry same day if permitted
-                    # NEW counter:
                     pf.sells_count += 1
 
         # --------- Buys (momentum &/or reversal) ---------
-        current_date = ts.date()
-
         def try_buys(sig_df: Optional[pd.DataFrame], *, label: str):
             """label = 'momentum' or 'reversal' for counting."""
             nonlocal pf
@@ -322,8 +315,6 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
                 return
 
             for sym in close.columns:
-                if ONE_BUY_PER_ASSET_PER_DAY and pf.last_buy_date.get(sym) == current_date:
-                    continue
                 if not sig_df.loc[ts, sym]:
                     continue
                 price = float(row[sym])
@@ -345,9 +336,8 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
                 p.qty  += qty
                 p.cost += qty * fill
                 pf.positions[sym] = p
-                pf.last_buy_date[sym] = current_date
 
-                # NEW: bump counters
+                # counters
                 if label == "momentum":
                     pf.buys_momentum += 1
                 elif label == "reversal":
@@ -422,7 +412,7 @@ def summarize(close: pd.DataFrame, equity: pd.DataFrame, pf: Portfolio) -> None:
     print(f"Max Drawdown:                                   {max_dd:.2f}%")
     print("=============================================================\n")
 
-    # NEW: print counters summary
+    # Counters summary
     print(f"Buys (momentum): {pf.buys_momentum} | Buys (dip/reversal): {pf.buys_reversal} | Sells (take-profit): {pf.sells_count}")
 
     # Per-asset snapshot
