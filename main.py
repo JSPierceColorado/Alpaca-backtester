@@ -10,6 +10,7 @@ main.py — Alpaca bots backtester (MODE=momentum | rsi_reversal | both)
     * buys_momentum
     * buys_reversal (dip buys)
     * sells_count
+- Robust fetching: batching symbols, 90-day slices, pagination, and diagnostics
 
 ENV (examples)
 --------------
@@ -19,8 +20,8 @@ END_DATE=2025-10-22
 BACKTEST_YEARS=1
 
 BAR_MINUTES=15
-UNIVERSE=AAPL,MSFT,SPY
-ALPACA_DATA_FEED=iex
+UNIVERSE=AAPL,MSFT,AMZN,GOOGL,META,NVDA,TSLA,JPM,V,JNJ,PG,XOM,CVX,HD,MA,UNH,KO,PEP,AVGO,LLY,SPY
+ALPACA_DATA_FEED=iex      # or "sip" if your account has SIP
 APCA_API_KEY_ID=...
 APCA_API_SECRET_KEY=...
 
@@ -31,6 +32,7 @@ MIN_ORDER_DOLLARS=1.0
 BIWEEKLY_CONTRIB=50.0
 FEE_PCT=0.0
 SLIPPAGE_PCT=0.0
+DEBUG=1                   # optional: prints fetch diagnostics
 """
 from __future__ import annotations
 
@@ -60,6 +62,7 @@ BACKTEST_YEARS = int(os.getenv("BACKTEST_YEARS", "1"))
 
 BAR_MINUTES = int(os.getenv("BAR_MINUTES", "15"))
 DATA_FEED   = os.getenv("ALPACA_DATA_FEED", "iex").strip() or None
+DEBUG       = os.getenv("DEBUG", "0").lower() in ("1","true","yes")
 
 UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "SPY,QQQ,IWM,DIA").split(",") if s.strip()]
 if "SPY" not in UNIVERSE:
@@ -82,7 +85,6 @@ API_SECRET = os.environ.get("APCA_API_SECRET_KEY")
 # Date helpers
 # -----------------------
 def _parse_dates() -> Tuple[pd.Timestamp, pd.Timestamp]:
-    """Resolve [start, end] and print like your Fidelity script."""
     today_tz = pd.Timestamp.now(tz=TZ).normalize()
     end = pd.Timestamp(END_DATE, tz=TZ) if END_DATE else today_tz
     if START_DATE:
@@ -100,41 +102,77 @@ def _ensure_tz(index: pd.Index, target_tz: str) -> pd.DatetimeIndex:
     return idx.tz_convert(target_tz)
 
 # -----------------------
-# Data fetching (single-shot request; no pagination)
+# Robust data fetching
 # -----------------------
+def _chunk(seq: List[str], n: int) -> List[List[str]]:
+    return [seq[i:i+n] for i in range(0, len(seq), n)]
+
+def _daterange_slices(start: pd.Timestamp, end: pd.Timestamp, days_per: int = 90) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    # contiguous slices; server handles inclusive/exclusive edges
+    slices = []
+    cur = start
+    while cur < end:
+        nxt = min(cur + pd.Timedelta(days=days_per), end)
+        slices.append((cur, nxt))
+        cur = nxt
+    return slices
+
 def _fetch_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, minutes: int) -> pd.DataFrame:
     if not (API_KEY and API_SECRET):
         raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY env vars")
     client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
-    req_kwargs = dict(
-        symbol_or_symbols=symbols,
-        timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
-        start=start.tz_convert("UTC").to_pydatetime(),
-        end=end.tz_convert("UTC").to_pydatetime(),
-        limit=None,
-    )
-    if DATA_FEED:
-        req_kwargs["feed"] = DATA_FEED
+    all_records: List[dict] = []
+    tf = TimeFrame(minutes, TimeFrameUnit.Minute)
+    slices = _daterange_slices(start.tz_convert("UTC"), end.tz_convert("UTC"), days_per=90)
+    batches = _chunk(symbols, 50)
 
-    try:
-        bars = client.get_stock_bars(StockBarsRequest(**req_kwargs))
-    except Exception as e:
-        print(f"[WARN] fetch error: {e}", file=sys.stderr)
-        raise
+    for batch in batches:
+        for (s0, s1) in slices:
+            page_token = None
+            page_i = 0
+            while True:
+                req_kwargs = dict(
+                    symbol_or_symbols=batch,
+                    timeframe=tf,
+                    start=s0.to_pydatetime(),
+                    end=s1.to_pydatetime(),
+                    limit=10000,
+                )
+                if DATA_FEED:
+                    req_kwargs["feed"] = DATA_FEED
+                if page_token:
+                    req_kwargs["page_token"] = page_token
 
-    records = []
-    for sym, sb in bars.data.items():
-        for b in sb:
-            records.append({"timestamp": b.timestamp, "symbol": sym, "close": float(b.close)})
+                try:
+                    resp = client.get_stock_bars(StockBarsRequest(**req_kwargs))
+                except Exception as e:
+                    print(f"[WARN] fetch error batch={len(batch)} slice={s0.date()}→{s1.date()} page={page_i}: {e}", file=sys.stderr)
+                    break
 
-    if not records:
+                got = 0
+                for sym, sb in resp.data.items():
+                    for b in sb:
+                        all_records.append({"timestamp": b.timestamp, "symbol": sym, "close": float(b.close)})
+                        got += 1
+
+                if DEBUG:
+                    print(f"[DEBUG] slice {s0.date()}→{s1.date()} batch({len(batch)}) page={page_i} rows={got}")
+
+                page_token = getattr(resp, "next_page_token", None)
+                page_i += 1
+                if not page_token:
+                    break
+
+    if not all_records:
         return pd.DataFrame()
 
-    df = pd.DataFrame.from_records(records)
+    df = pd.DataFrame.from_records(all_records)
     df.sort_values(["timestamp", "symbol"], inplace=True)
     pivot = df.pivot(index="timestamp", columns="symbol", values="close")
     pivot.index = _ensure_tz(pivot.index, TZ)
+    # Deduplicate any overlapping timestamps across slices; keep last
+    pivot = pivot[~pivot.index.duplicated(keep="last")]
     return pivot.sort_index()
 
 # -----------------------
@@ -162,18 +200,15 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 # Signals & gates
 # -----------------------
 def spy_gate_allow_buys(close: pd.DataFrame) -> pd.Series:
-    """True where SPY MA60 > MA240 (momentum buy-gate and sell-gate)."""
     spy = close["SPY"]
     ma60 = spy.rolling(60, min_periods=60).mean()
     ma240 = spy.rolling(240, min_periods=240).mean()
     return (ma60 > ma240) & (~ma60.isna()) & (~ma240.isna())
 
 def spy_gate_allow_sells(close: pd.DataFrame) -> pd.Series:
-    """Sells allowed only when SPY MA60 > MA240."""
     return spy_gate_allow_buys(close)
 
 def spy_gate_allow_buys_reversal(close: pd.DataFrame) -> pd.Series:
-    """True where SPY MA60 < MA240 (RSI-reversal buy-gate)."""
     spy = close["SPY"]
     ma60 = spy.rolling(60, min_periods=60).mean()
     ma240 = spy.rolling(240, min_periods=240).mean()
@@ -183,13 +218,6 @@ def _safe_bool(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(bool).fillna(False)
 
 def signals_momentum(close: pd.DataFrame) -> pd.DataFrame:
-    """
-    Momentum rider (15m):
-      1) MA60 > MA240
-      2) Price > MA60
-      3) RSI14 in [55,70] and rising
-      4) MACD histogram > 0 and rising
-    """
     sig = pd.DataFrame(False, index=close.index, columns=close.columns)
     for sym in close.columns:
         px = close[sym]
@@ -204,11 +232,6 @@ def signals_momentum(close: pd.DataFrame) -> pd.DataFrame:
     return sig
 
 def signals_rsi_reversal(close: pd.DataFrame) -> pd.DataFrame:
-    """
-    RSI reversal (15m):
-      1) MA60 < MA240
-      2) RSI14 < 30
-    """
     sig = pd.DataFrame(False, index=close.index, columns=close.columns)
     for sym in close.columns:
         px = close[sym]
@@ -231,7 +254,6 @@ class Position:
 class Portfolio:
     cash: float = 0.0
     positions: Dict[str, Position] = field(default_factory=dict)
-    # Counters
     buys_momentum: int = 0
     buys_reversal: int = 0
     sells_count: int = 0
@@ -240,7 +262,6 @@ class Portfolio:
 # Execution helpers
 # -----------------------
 def _apply_fills(price: float, side: str) -> float:
-    """Slippage worsens price; fees applied on notional."""
     if side == 'buy':
         return price * (1 + SLIPPAGE_PCT)
     else:
@@ -256,7 +277,6 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
     pf = Portfolio(cash=0.0, positions={sym: Position() for sym in close.columns})
     equity_points: List[Tuple[pd.Timestamp, float]] = []
 
-    # signals & gates based on MODE
     if MODE == "momentum":
         sig_momo = _safe_bool(signals_momentum(close)); sig_rev = None
         gate_momo = spy_gate_allow_buys(close);         gate_rev = None
@@ -306,7 +326,6 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
 
         # --------- Buys (momentum &/or reversal) ---------
         def try_buys(sig_df: Optional[pd.DataFrame], *, label: str):
-            """label = 'momentum' or 'reversal' for counting."""
             nonlocal pf
             if sig_df is None:
                 return
@@ -337,17 +356,13 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
                 p.cost += qty * fill
                 pf.positions[sym] = p
 
-                # counters
                 if label == "momentum":
                     pf.buys_momentum += 1
                 elif label == "reversal":
                     pf.buys_reversal += 1
 
-        # momentum buys only when uptrend gate is true
         if gate_momo is not None and gate_momo.loc[ts]:
             try_buys(sig_momo, label="momentum")
-
-        # rsi-reversal buys only when downtrend gate is true
         if gate_rev is not None and gate_rev.loc[ts]:
             try_buys(sig_rev, label="reversal")
 
@@ -370,6 +385,14 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
 def summarize(close: pd.DataFrame, equity: pd.DataFrame, pf: Portfolio) -> None:
     start_dt, end_dt = close.index.min(), close.index.max()
     years = max((end_dt - start_dt).days / 365.25, 1e-9)
+
+    # Diagnostics
+    if DEBUG:
+        counts = {c: int(close[c].notna().sum()) for c in close.columns}
+        print(f"[DEBUG] bar counts (non-NaN): {sorted(counts.items(), key=lambda x: -x[1])[:10]}")
+        missing = [c for c in UNIVERSE if c not in close.columns or close[c].dropna().empty]
+        if missing:
+            print(f"[DEBUG] symbols with no data: {missing}")
 
     total_contribs = BIWEEKLY_CONTRIB * math.ceil(((end_dt.normalize() - start_dt.normalize()).days + 1) / 14)
     end_cash = pf.cash
@@ -412,10 +435,8 @@ def summarize(close: pd.DataFrame, equity: pd.DataFrame, pf: Portfolio) -> None:
     print(f"Max Drawdown:                                   {max_dd:.2f}%")
     print("=============================================================\n")
 
-    # Counters summary
     print(f"Buys (momentum): {pf.buys_momentum} | Buys (dip/reversal): {pf.buys_reversal} | Sells (take-profit): {pf.sells_count}")
 
-    # Per-asset snapshot
     print("\n--- Positions snapshot (end) ---")
     for sym, pos in pf.positions.items():
         if pos.qty <= 0:
@@ -426,7 +447,6 @@ def summarize(close: pd.DataFrame, equity: pd.DataFrame, pf: Portfolio) -> None:
         roi_sym = ((last - avg) / avg * 100.0) if (np.isfinite(last) and avg > 0) else float("nan")
         print(f"{sym:>6}: qty={pos.qty:.4f} avg=${avg:,.4f} last=${last:,.4f} MV=${mv_sym:,.2f} ROI={roi_sym:,.2f}%")
 
-    # Equity tail
     print("\n--- Last 10 equity points ---")
     print(equity.tail(10).to_string())
 
@@ -440,13 +460,13 @@ def main():
     start, end = _parse_dates()
     close = _fetch_bars(UNIVERSE, start, end, BAR_MINUTES)
     if close.empty:
-        raise RuntimeError("No bars returned. Check keys, feed, symbols, or date range.")
+        raise RuntimeError("No bars returned. Check keys, feed, symbols, date range, or permissions.")
 
-    # Keep only requested universe (columns that actually have data)
-    keep = [c for c in UNIVERSE if c in close.columns]
-    if not keep:
-        raise RuntimeError("Universe symbols have no data in returned frame.")
-    close = close[keep].sort_index()
+    # Keep only symbols that actually have data
+    have = [c for c in UNIVERSE if c in close.columns and close[c].notna().any()]
+    if "SPY" not in have:
+        raise RuntimeError("SPY data missing — cannot compute market gates. Try ALPACA_DATA_FEED=iex.")
+    close = close[have].sort_index()
 
     equity, pf = run_backtest(close)
     summarize(close, equity, pf)
