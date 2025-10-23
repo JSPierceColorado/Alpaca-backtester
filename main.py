@@ -8,6 +8,7 @@ main.py — Alpaca bots backtester (MODE=momentum | rsi_reversal | both)
 - Sells: take-profit at TAKE_PROFIT_PCT (default 5%), allowed only when SPY 15m MA60 > MA240
 - Compounding: all sale proceeds return to cash and can be reused
 - Counters printed in summary: buys_momentum, buys_reversal (dip), sells_count
+- Diagnostics (DEBUG=1): fetch pages, bar counts, and signal/gate coverage
 
 ENV (examples)
 --------------
@@ -29,7 +30,7 @@ MIN_ORDER_DOLLARS=1.0
 BIWEEKLY_CONTRIB=50.0
 FEE_PCT=0.0
 SLIPPAGE_PCT=0.0
-DEBUG=1                   # optional: prints fetch diagnostics
+DEBUG=1                   # optional: prints fetch & signal diagnostics
 """
 from __future__ import annotations
 
@@ -533,6 +534,29 @@ def main():
     if "SPY" not in have:
         raise RuntimeError("SPY data missing — cannot compute market gates. Try ALPACA_DATA_FEED=iex or enable SIP.")
     close = close[have].sort_index()
+
+    # --- quick diagnostics (no logic changes) ---
+    if DEBUG:
+        gate_momo = spy_gate_allow_buys(close)
+        gate_rev  = spy_gate_allow_buys_reversal(close)
+        sig_momo  = _safe_bool(signals_momentum(close))
+        sig_rev   = _safe_bool(signals_rsi_reversal(close))
+
+        print("[DIAG] SPY gates: uptrend bars=", int(gate_momo.sum()),
+              " downtrend bars=", int(gate_rev.sum()),
+              " total bars=", close.shape[0])
+
+        momo_counts = {c: int(sig_momo[c].sum()) for c in sig_momo.columns}
+        rev_counts  = {c: int(sig_rev[c].sum())  for c in sig_rev.columns}
+        print("[DIAG] top momentum signal counts:",
+              sorted(momo_counts.items(), key=lambda x: -x[1])[:8])
+        print("[DIAG] top reversal signal counts:",
+              sorted(rev_counts.items(), key=lambda x: -x[1])[:8])
+
+        allowed_momo = int((gate_momo & sig_momo.any(axis=1)).sum())
+        allowed_rev  = int((gate_rev  & sig_rev.any(axis=1)).sum())
+        print(f"[DIAG] bars with at least one momentum signal while buy-gate open: {allowed_momo}")
+        print(f"[DIAG] bars with at least one reversal signal while buy-gate open: {allowed_rev}")
 
     equity, pf = run_backtest(close)
     summarize(close, equity, pf)
