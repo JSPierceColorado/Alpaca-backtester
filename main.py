@@ -2,15 +2,12 @@
 """
 main.py — Alpaca bots backtester (MODE=momentum | rsi_reversal | both)
 
+- Data fetch: per-symbol pagination (limit=10000, next_page_token) with 1m fallback → resample to 15m
+- Buys: NO once-per-day restriction
+- Contributions: +$50 every 14 days starting at START_DATE
 - Sells: take-profit at TAKE_PROFIT_PCT (default 5%), allowed only when SPY 15m MA60 > MA240
-- Contributions: adds $50 to buying power every 2 weeks starting at START_DATE
-- All sale proceeds go back to buying power (compounding)
-- Buys: NO once-per-day restriction (can buy the same symbol multiple times per day if signals persist)
-- Counters printed in summary:
-    * buys_momentum
-    * buys_reversal (dip buys)
-    * sells_count
-- Robust fetching: batching symbols, 90-day slices, pagination, and diagnostics
+- Compounding: all sale proceeds return to cash and can be reused
+- Counters printed in summary: buys_momentum, buys_reversal (dip), sells_count
 
 ENV (examples)
 --------------
@@ -85,6 +82,7 @@ API_SECRET = os.environ.get("APCA_API_SECRET_KEY")
 # Date helpers
 # -----------------------
 def _parse_dates() -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """Resolve [start, end] and print like your Fidelity script."""
     today_tz = pd.Timestamp.now(tz=TZ).normalize()
     end = pd.Timestamp(END_DATE, tz=TZ) if END_DATE else today_tz
     if START_DATE:
@@ -102,78 +100,128 @@ def _ensure_tz(index: pd.Index, target_tz: str) -> pd.DatetimeIndex:
     return idx.tz_convert(target_tz)
 
 # -----------------------
-# Robust data fetching
+# Robust per-symbol data fetching (pagination + 1m fallback)
 # -----------------------
-def _chunk(seq: List[str], n: int) -> List[List[str]]:
-    return [seq[i:i+n] for i in range(0, len(seq), n)]
+def _fetch_symbol_bars(
+    client: StockHistoricalDataClient,
+    symbol: str,
+    start_utc: pd.Timestamp,
+    end_utc: pd.Timestamp,
+    minutes: int,
+    feed: Optional[str],
+    max_pages: int = 1000,
+) -> pd.Series:
+    """Fetch bars for a single symbol with proper pagination."""
+    tf = TimeFrame(minutes, TimeFrameUnit.Minute)
+    page_token = None
+    pages = 0
+    rows = []
 
-def _daterange_slices(start: pd.Timestamp, end: pd.Timestamp, days_per: int = 90) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
-    # contiguous slices; server handles inclusive/exclusive edges
-    slices = []
-    cur = start
-    while cur < end:
-        nxt = min(cur + pd.Timedelta(days=days_per), end)
-        slices.append((cur, nxt))
-        cur = nxt
-    return slices
+    while True:
+        req_kwargs = dict(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start_utc.to_pydatetime(),
+            end=end_utc.to_pydatetime(),
+            limit=10000,
+        )
+        if feed:
+            req_kwargs["feed"] = feed
+        if page_token:
+            req_kwargs["page_token"] = page_token
+
+        resp = client.get_stock_bars(StockBarsRequest(**req_kwargs))
+
+        got = 0
+        sb = resp.data.get(symbol, [])
+        for b in sb:
+            rows.append((b.timestamp, float(b.close)))
+            got += 1
+
+        page_token = getattr(resp, "next_page_token", None)
+        if DEBUG:
+            print(f"[DEBUG] {symbol} {minutes}m page={pages} rows={got} next={bool(page_token)}")
+        pages += 1
+        if not page_token or pages >= max_pages:
+            break
+
+    if not rows:
+        return pd.Series(dtype=float)
+
+    ser = pd.Series(
+        data=[v for _, v in rows],
+        index=pd.DatetimeIndex([t for t, _ in rows]),
+        name=symbol,
+        dtype=float,
+    )
+    ser.index = _ensure_tz(ser.index, TZ)
+    ser = ser[~ser.index.duplicated(keep="last")].sort_index()
+    return ser
+
+
+def _fetch_symbol_bars_with_fallback(
+    client: StockHistoricalDataClient,
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    minutes: int,
+    feed: Optional[str],
+) -> pd.Series:
+    """
+    Try native {minutes}-minute bars first; if too sparse (< 260 bars ~ < 10 trading days),
+    refetch 1-minute and resample to {minutes} minutes (last price).
+    """
+    start_utc = start.tz_convert("UTC")
+    end_utc = end.tz_convert("UTC")
+
+    ser = _fetch_symbol_bars(client, symbol, start_utc, end_utc, minutes, feed)
+    if ser.shape[0] >= 260 or minutes == 1:
+        return ser
+
+    if DEBUG:
+        print(f"[DEBUG] {symbol}: only {ser.shape[0]} bars at {minutes}m — trying 1m fallback → resample")
+
+    ser1 = _fetch_symbol_bars(client, symbol, start_utc, end_utc, 1, feed)
+    if ser1.empty:
+        return ser  # nothing better
+
+    # resample to target minutes using last close
+    ser1 = ser1.sort_index()
+    ser_res = ser1.resample(f"{minutes}T").last().dropna()
+    ser_res.name = symbol
+
+    if DEBUG:
+        print(f"[DEBUG] {symbol}: 1m fallback produced {ser_res.shape[0]} bars at {minutes}m")
+
+    return ser_res
+
 
 def _fetch_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, minutes: int) -> pd.DataFrame:
+    """Fetch each symbol independently with pagination and fallback to 1m→resample."""
     if not (API_KEY and API_SECRET):
         raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY env vars")
+
     client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
-    all_records: List[dict] = []
-    tf = TimeFrame(minutes, TimeFrameUnit.Minute)
-    slices = _daterange_slices(start.tz_convert("UTC"), end.tz_convert("UTC"), days_per=90)
-    batches = _chunk(symbols, 50)
-
-    for batch in batches:
-        for (s0, s1) in slices:
-            page_token = None
-            page_i = 0
-            while True:
-                req_kwargs = dict(
-                    symbol_or_symbols=batch,
-                    timeframe=tf,
-                    start=s0.to_pydatetime(),
-                    end=s1.to_pydatetime(),
-                    limit=10000,
-                )
-                if DATA_FEED:
-                    req_kwargs["feed"] = DATA_FEED
-                if page_token:
-                    req_kwargs["page_token"] = page_token
-
-                try:
-                    resp = client.get_stock_bars(StockBarsRequest(**req_kwargs))
-                except Exception as e:
-                    print(f"[WARN] fetch error batch={len(batch)} slice={s0.date()}→{s1.date()} page={page_i}: {e}", file=sys.stderr)
-                    break
-
-                got = 0
-                for sym, sb in resp.data.items():
-                    for b in sb:
-                        all_records.append({"timestamp": b.timestamp, "symbol": sym, "close": float(b.close)})
-                        got += 1
-
+    series_list = []
+    for sym in symbols:
+        try:
+            s = _fetch_symbol_bars_with_fallback(client, sym, start, end, minutes, DATA_FEED)
+            if s.empty:
                 if DEBUG:
-                    print(f"[DEBUG] slice {s0.date()}→{s1.date()} batch({len(batch)}) page={page_i} rows={got}")
+                    print(f"[DEBUG] {sym}: no bars returned")
+                continue
+            series_list.append(s)
+        except Exception as e:
+            print(f"[WARN] fetch failed for {sym}: {e}", file=sys.stderr)
 
-                page_token = getattr(resp, "next_page_token", None)
-                page_i += 1
-                if not page_token:
-                    break
-
-    if not all_records:
+    if not series_list:
         return pd.DataFrame()
 
-    df = pd.DataFrame.from_records(all_records)
-    df.sort_values(["timestamp", "symbol"], inplace=True)
-    pivot = df.pivot(index="timestamp", columns="symbol", values="close")
-    pivot.index = _ensure_tz(pivot.index, TZ)
-    # Deduplicate any overlapping timestamps across slices; keep last
-    pivot = pivot[~pivot.index.duplicated(keep="last")]
-    return pivot.sort_index()
+    df = pd.concat(series_list, axis=1)
+    # Deduplicate timestamps (paranoia) and sort
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
 
 # -----------------------
 # Indicators
@@ -200,15 +248,18 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 # Signals & gates
 # -----------------------
 def spy_gate_allow_buys(close: pd.DataFrame) -> pd.Series:
+    """True where SPY MA60 > MA240 (momentum buy-gate and sell-gate)."""
     spy = close["SPY"]
     ma60 = spy.rolling(60, min_periods=60).mean()
     ma240 = spy.rolling(240, min_periods=240).mean()
     return (ma60 > ma240) & (~ma60.isna()) & (~ma240.isna())
 
 def spy_gate_allow_sells(close: pd.DataFrame) -> pd.Series:
+    """Sells allowed only when SPY MA60 > MA240."""
     return spy_gate_allow_buys(close)
 
 def spy_gate_allow_buys_reversal(close: pd.DataFrame) -> pd.Series:
+    """True where SPY MA60 < MA240 (RSI-reversal buy-gate)."""
     spy = close["SPY"]
     ma60 = spy.rolling(60, min_periods=60).mean()
     ma240 = spy.rolling(240, min_periods=240).mean()
@@ -218,6 +269,13 @@ def _safe_bool(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(bool).fillna(False)
 
 def signals_momentum(close: pd.DataFrame) -> pd.DataFrame:
+    """
+    Momentum rider (15m):
+      1) MA60 > MA240
+      2) Price > MA60
+      3) RSI14 in [55,70] and rising
+      4) MACD histogram > 0 and rising
+    """
     sig = pd.DataFrame(False, index=close.index, columns=close.columns)
     for sym in close.columns:
         px = close[sym]
@@ -232,6 +290,11 @@ def signals_momentum(close: pd.DataFrame) -> pd.DataFrame:
     return sig
 
 def signals_rsi_reversal(close: pd.DataFrame) -> pd.DataFrame:
+    """
+    RSI reversal (15m):
+      1) MA60 < MA240
+      2) RSI14 < 30
+    """
     sig = pd.DataFrame(False, index=close.index, columns=close.columns)
     for sym in close.columns:
         px = close[sym]
@@ -262,6 +325,7 @@ class Portfolio:
 # Execution helpers
 # -----------------------
 def _apply_fills(price: float, side: str) -> float:
+    """Slippage worsens price; fees applied on notional."""
     if side == 'buy':
         return price * (1 + SLIPPAGE_PCT)
     else:
@@ -277,6 +341,7 @@ def run_backtest(close: pd.DataFrame) -> Tuple[pd.DataFrame, Portfolio]:
     pf = Portfolio(cash=0.0, positions={sym: Position() for sym in close.columns})
     equity_points: List[Tuple[pd.Timestamp, float]] = []
 
+    # signals & gates based on MODE
     if MODE == "momentum":
         sig_momo = _safe_bool(signals_momentum(close)); sig_rev = None
         gate_momo = spy_gate_allow_buys(close);         gate_rev = None
@@ -389,7 +454,8 @@ def summarize(close: pd.DataFrame, equity: pd.DataFrame, pf: Portfolio) -> None:
     # Diagnostics
     if DEBUG:
         counts = {c: int(close[c].notna().sum()) for c in close.columns}
-        print(f"[DEBUG] bar counts (non-NaN): {sorted(counts.items(), key=lambda x: -x[1])[:10]}")
+        top = sorted(counts.items(), key=lambda x: -x[1])[:10]
+        print(f"[DEBUG] bar counts (non-NaN) top10: {top}")
         missing = [c for c in UNIVERSE if c not in close.columns or close[c].dropna().empty]
         if missing:
             print(f"[DEBUG] symbols with no data: {missing}")
@@ -465,7 +531,7 @@ def main():
     # Keep only symbols that actually have data
     have = [c for c in UNIVERSE if c in close.columns and close[c].notna().any()]
     if "SPY" not in have:
-        raise RuntimeError("SPY data missing — cannot compute market gates. Try ALPACA_DATA_FEED=iex.")
+        raise RuntimeError("SPY data missing — cannot compute market gates. Try ALPACA_DATA_FEED=iex or enable SIP.")
     close = close[have].sort_index()
 
     equity, pf = run_backtest(close)
